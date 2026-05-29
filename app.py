@@ -1,36 +1,85 @@
 import streamlit as st
 import pandas as pd
 import os
-import json
+import gspread
+from google.oauth2.service_account import Credentials
 from datetime import datetime
 
 # --- Config ---
 st.set_page_config(page_title="ENJBC Coach Feedback", layout="centered")
 
 PARTICIPANTS_CSV = os.path.join(os.path.dirname(__file__), "participants.csv")
-FEEDBACK_DIR = os.path.join(os.path.dirname(__file__), "feedback")
-SUBMITTED_FILE = os.path.join(os.path.dirname(__file__), "submitted_teams.json")
 
-os.makedirs(FEEDBACK_DIR, exist_ok=True)
+# --- Master Users (loaded from Streamlit secrets) ---
+MASTER_USERS = dict(st.secrets.get("admin_users", {}))
 
-# --- Master Users ---
-MASTER_USERS = {
-    "president@enjbc.org.au": "@Jc31423142",
-    "operations@enjbc.org.au": "VinnieJets",
-}
+# --- Google Sheets Connection ---
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+@st.cache_resource
+def get_gspread_client():
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+def get_sheet():
+    client = get_gspread_client()
+    spreadsheet_id = st.secrets["spreadsheet"]["id"]
+    return client.open_by_key(spreadsheet_id)
 
 # --- Helper Functions ---
 def load_submitted_teams():
-    if os.path.exists(SUBMITTED_FILE):
-        with open(SUBMITTED_FILE, "r") as f:
-            return json.load(f)
-    return {}
+    """Load submitted teams from Google Sheet 'Submissions' worksheet."""
+    try:
+        sh = get_sheet()
+        ws = sh.worksheet("Submissions")
+        records = ws.get_all_records()
+        return {r["Team"]: {"coach": r["Coach"], "submitted_at": r["Submitted At"]} for r in records}
+    except gspread.exceptions.WorksheetNotFound:
+        sh = get_sheet()
+        sh.add_worksheet(title="Submissions", rows=100, cols=3)
+        ws = sh.worksheet("Submissions")
+        ws.append_row(["Team", "Coach", "Submitted At"])
+        return {}
+    except Exception:
+        return {}
 
 def save_submitted_team(team_name, coach_name):
-    data = load_submitted_teams()
-    data[team_name] = {"coach": coach_name, "submitted_at": datetime.now().isoformat()}
-    with open(SUBMITTED_FILE, "w") as f:
-        json.dump(data, f)
+    """Save submitted team to Google Sheet 'Submissions' worksheet."""
+    sh = get_sheet()
+    try:
+        ws = sh.worksheet("Submissions")
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title="Submissions", rows=100, cols=3)
+        ws.append_row(["Team", "Coach", "Submitted At"])
+    ws.append_row([team_name, coach_name, datetime.now().isoformat()])
+
+def save_feedback(feedback_df):
+    """Append feedback rows to Google Sheet 'Feedback' worksheet."""
+    sh = get_sheet()
+    try:
+        ws = sh.worksheet("Feedback")
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title="Feedback", rows=1000, cols=20)
+        ws.append_row(list(feedback_df.columns))
+    # Append all rows
+    rows = feedback_df.values.tolist()
+    ws.append_rows(rows)
+
+def load_all_feedback():
+    """Load all feedback from Google Sheet 'Feedback' worksheet."""
+    try:
+        sh = get_sheet()
+        ws = sh.worksheet("Feedback")
+        records = ws.get_all_records()
+        if records:
+            return pd.DataFrame(records)
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 def load_roster():
     df = pd.read_csv(PARTICIPANTS_CSV)
@@ -98,16 +147,16 @@ if st.session_state.is_master:
     st.markdown("---")
     st.subheader("Submitted Feedback")
     
-    feedback_files = [f for f in os.listdir(FEEDBACK_DIR) if f.endswith(".csv")]
+    all_feedback = load_all_feedback()
     
-    if not feedback_files:
+    if all_feedback.empty:
         st.info("No feedback submitted yet.")
     else:
-        for f in sorted(feedback_files):
-            team_name = f.replace(".csv", "").replace("_", " ")
+        teams_in_feedback = sorted(all_feedback["Team"].unique().tolist())
+        for team_name in teams_in_feedback:
             st.markdown(f"### {team_name}")
-            df = pd.read_csv(os.path.join(FEEDBACK_DIR, f))
-            st.dataframe(df, use_container_width=True)
+            team_df = all_feedback[all_feedback["Team"] == team_name]
+            st.dataframe(team_df, use_container_width=True)
             st.markdown("---")
     st.stop()
 
@@ -218,14 +267,13 @@ else:
     col1, col2 = st.columns(2)
     with col1:
         if st.button("✅ Yes, Submit", type="primary"):
-            # Save feedback
+            # Save feedback to Google Sheets
             feedback_df = pd.DataFrame(feedback_data)
             feedback_df["Coach"] = certify_name.strip()
             feedback_df["Team"] = selected_team
             feedback_df["Submitted At"] = datetime.now().isoformat()
             
-            filename = selected_team.replace(" ", "_") + ".csv"
-            feedback_df.to_csv(os.path.join(FEEDBACK_DIR, filename), index=False)
+            save_feedback(feedback_df)
             save_submitted_team(selected_team, certify_name.strip())
             
             st.success("✅ Feedback submitted successfully! Thank you.")
